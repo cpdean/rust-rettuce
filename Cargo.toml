@@ -8,3 +8,4 @@ edition = "2018"
 
 [dependencies]
 tokio = "0.1.22"
+futures = "0.1.28"

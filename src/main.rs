@@ -23,12 +23,91 @@
 
 extern crate tokio;
 
+extern crate futures;
+
 use tokio::io;
 use tokio::net::TcpListener;
 use tokio::prelude::*;
 
 use std::env;
 use std::net::SocketAddr;
+
+pub struct CacheSession<R, W> {
+    reader: Option<R>,
+    read_done: bool,
+    writer: Option<W>,
+    pos: usize,
+    cap: usize,
+    amt: u64,
+    buf: Box<[u8]>,
+}
+
+pub fn cache_session<R, W>(reader: R, writer: W) -> CacheSession<R, W>
+where
+    R: AsyncRead,
+    W: AsyncWrite,
+{
+    CacheSession {
+        reader: Some(reader),
+        read_done: false,
+        writer: Some(writer),
+        amt: 0,
+        pos: 0,
+        cap: 0,
+        buf: Box::new([0; 2048]),
+    }
+}
+
+impl<R, W> Future for CacheSession<R, W>
+where
+    R: AsyncRead,
+    W: AsyncWrite,
+{
+    type Item = (u64, R, W);
+    type Error = io::Error;
+
+    fn poll(&mut self) -> Poll<(u64, R, W), io::Error> {
+        loop {
+            // If our buffer is empty, then we need to read some data to
+            // continue.
+            if self.pos == self.cap && !self.read_done {
+                let reader = self.reader.as_mut().unwrap();
+                let n = futures::try_ready!(reader.poll_read(&mut self.buf));
+                if n == 0 {
+                    self.read_done = true;
+                } else {
+                    self.pos = 0;
+                    self.cap = n;
+                }
+            }
+
+            // If our buffer has some data, let's write it out!
+            while self.pos < self.cap {
+                let writer = self.writer.as_mut().unwrap();
+                let i = futures::try_ready!(writer.poll_write(&self.buf[self.pos..self.cap]));
+                if i == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "write zero byte into writer",
+                    ));
+                } else {
+                    self.pos += i;
+                    self.amt += i as u64;
+                }
+            }
+
+            // If we've written al the data and we've seen EOF, flush out the
+            // data and finish the transfer.
+            // done with the entire transfer.
+            if self.pos == self.cap && self.read_done {
+                futures::try_ready!(self.writer.as_mut().unwrap().poll_flush());
+                let reader = self.reader.take().unwrap();
+                let writer = self.writer.take().unwrap();
+                return Ok((self.amt, reader, writer).into());
+            }
+        }
+    }
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Allow passing an address to listen on as the first argument of this
