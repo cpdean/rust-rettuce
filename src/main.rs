@@ -36,10 +36,8 @@ pub struct CacheSession<R, W> {
     reader: Option<R>,
     read_done: bool,
     writer: Option<W>,
-    pos: usize,
-    cap: usize,
+    msg_in_flight: Option<String>,
     amt: u64,
-    buf: Box<[u8]>,
 }
 
 pub fn cache_session<R, W>(
@@ -56,10 +54,8 @@ where
         reader: Some(reader),
         read_done: false,
         writer: Some(writer),
+        msg_in_flight: None,
         amt: 0,
-        pos: 0,
-        cap: 0,
-        buf: Box::new([0; 2048]),
     }
 }
 
@@ -73,42 +69,39 @@ where
 
     fn poll(&mut self) -> Poll<(u64, tokio::io::Lines<std::io::BufReader<R>>, W), io::Error> {
         loop {
-            // If our buffer is empty, then we need to read some data to
-            // continue.
-            if self.pos == self.cap && !self.read_done {
+            // if we do not have a line we are working on, get one
+            if let None = self.msg_in_flight {
                 let reader = self.reader.as_mut().unwrap();
                 let n: Option<String> = futures::try_ready!(reader.poll());
-                match n {
+                self.msg_in_flight = match n {
                     Some(line) => {
                         println!("got line {}", line);
                         self.amt += 1;
+                        Some(line)
                     }
                     None => {
                         self.read_done = true;
+                        None
                     }
-                }
+                };
             }
 
-            // If our buffer has some data, let's write it out!
-            while self.pos < self.cap {
+            // if we got a line from a past run, or earlier in this loop, process it
+            if let Some(line) = &self.msg_in_flight {
+                println!("sending echo back");
                 let writer = self.writer.as_mut().unwrap();
-                let i = futures::try_ready!(writer.poll_write(&self.buf[self.pos..self.cap]));
-                if i == 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "write zero byte into writer",
-                    ));
-                } else {
-                    self.pos += i;
-                    self.amt += i as u64;
-                }
+                let i = futures::try_ready!(writer.poll_write(format!("+{}\n", line).as_bytes()));
+                println!("what is this i? {}", i);
+                self.msg_in_flight = None;
             }
 
             // If we've written al the data and we've seen EOF, flush out the
             // data and finish the transfer.
             // done with the entire transfer.
-            if self.pos == self.cap && self.read_done {
+            if self.read_done {
+                println!("client is closed! waiting on flushing data");
                 futures::try_ready!(self.writer.as_mut().unwrap().poll_flush());
+                // i don't know what these do
                 let reader = self.reader.take().unwrap();
                 let writer = self.writer.take().unwrap();
                 return Ok((self.amt, reader, writer).into());
