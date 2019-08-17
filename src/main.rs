@@ -42,11 +42,16 @@ pub struct CacheSession<R, W> {
     buf: Box<[u8]>,
 }
 
-pub fn cache_session<R, W>(reader: R, writer: W) -> CacheSession<R, W>
+pub fn cache_session<R, W>(
+    reader: R,
+    writer: W,
+) -> CacheSession<tokio::io::Lines<std::io::BufReader<R>>, W>
 where
     R: AsyncRead,
     W: AsyncWrite,
 {
+    let buf_stream = std::io::BufReader::new(reader);
+    let reader = tokio::io::lines(buf_stream);
     CacheSession {
         reader: Some(reader),
         read_done: false,
@@ -58,26 +63,29 @@ where
     }
 }
 
-impl<R, W> Future for CacheSession<R, W>
+impl<R, W> Future for CacheSession<tokio::io::Lines<std::io::BufReader<R>>, W>
 where
     R: AsyncRead,
     W: AsyncWrite,
 {
-    type Item = (u64, R, W);
+    type Item = (u64, tokio::io::Lines<std::io::BufReader<R>>, W);
     type Error = io::Error;
 
-    fn poll(&mut self) -> Poll<(u64, R, W), io::Error> {
+    fn poll(&mut self) -> Poll<(u64, tokio::io::Lines<std::io::BufReader<R>>, W), io::Error> {
         loop {
             // If our buffer is empty, then we need to read some data to
             // continue.
             if self.pos == self.cap && !self.read_done {
                 let reader = self.reader.as_mut().unwrap();
-                let n = futures::try_ready!(reader.poll_read(&mut self.buf));
-                if n == 0 {
-                    self.read_done = true;
-                } else {
-                    self.pos = 0;
-                    self.cap = n;
+                let n: Option<String> = futures::try_ready!(reader.poll());
+                match n {
+                    Some(line) => {
+                        println!("got line {}", line);
+                        self.amt += 1;
+                    }
+                    None => {
+                        self.read_done = true;
+                    }
                 }
             }
 
@@ -155,8 +163,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The `copy` function then returns a future, and this future will be
             // resolved when the copying operation is complete, resolving to the
             // amount of data that was copied.
+
             let (reader, writer) = socket.split();
-            let amt = io::copy(reader, writer);
+            //let amt = io::copy(reader, writer);
+            let amt = cache_session(reader, writer);
 
             // After our copy operation is complete we just print out some helpful
             // information.
