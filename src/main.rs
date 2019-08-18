@@ -32,17 +32,25 @@ use tokio::prelude::*;
 use std::env;
 use std::net::SocketAddr;
 
+use futures::sync::{mpsc, oneshot};
+use std::collections::HashMap;
+
+// just like in erlang, you a message has a return address
+type CacheWriteMessage = (oneshot::Sender<String>, (String, String));
+
 pub struct CacheSession<R, W> {
     reader: Option<R>,
     read_done: bool,
     writer: Option<W>,
     msg_in_flight: Option<String>,
     amt: u64,
+    cache_sender: mpsc::Sender<CacheWriteMessage>,
 }
 
 pub fn cache_session<R, W>(
     reader: R,
     writer: W,
+    cache_sender: mpsc::Sender<CacheWriteMessage>,
 ) -> CacheSession<tokio::io::Lines<std::io::BufReader<R>>, W>
 where
     R: AsyncRead,
@@ -56,6 +64,7 @@ where
         writer: Some(writer),
         msg_in_flight: None,
         amt: 0,
+        cache_sender: cache_sender,
     }
 }
 
@@ -89,9 +98,33 @@ where
             // if we got a line from a past run, or earlier in this loop, process it
             if let Some(line) = &self.msg_in_flight {
                 println!("sending echo back");
-                let writer = self.writer.as_mut().unwrap();
-                let i = futures::try_ready!(writer.poll_write(format!("+{}\n", line).as_bytes()));
-                println!("what is this i? {}", i);
+                let (tx, rx) = oneshot::channel();
+                // somehow i want to send the <k, v> to the cache through cache sender,
+                // and then when it works, send a message back to the client that it worked or that
+                // it didn't work
+                //
+                // I think I need to send it a oneshot rx so that the cache has a way to send the
+                // response back to this client task, but I am having a lot of trouble getting the
+                // compiler to let me do this.  I don't know how to combine this chain-reaction of
+                // inter-related features correctly.
+
+                // old code with compiler error:
+                self.cache_sender
+                    .send((tx, ("kgoat".to_string(), "vgoat".to_string())))
+                    .map_err(|_| ())
+                    .and_then(|cache_sender_handler| {
+                        rx.and_then(|cache_response| {
+                            let msg_to_client = format!("+{}\n", cache_response);
+                            let writer = self.writer.as_mut().unwrap();
+                            writer.write_all(msg_to_client.as_bytes())
+                        })
+                        .map_err(|_| ())
+                        .and_then(|_| println!("i dont know what this means anymore"))
+                    });
+
+                // that i am tracking msg_in_flight out of band with the progress of futures
+                // is probably telling me that i am not doing something right here.  shouldn't this
+                // just be a future?
                 self.msg_in_flight = None;
             }
 
@@ -117,6 +150,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let addr = env::args().nth(1).unwrap_or("127.0.0.1:8080".to_string());
     let addr = addr.parse::<SocketAddr>()?;
 
+    // make a channel so sessions can send messages to the cache
+    let (cache_sender, cache_receiver) = mpsc::channel(1_024);
+    let cache: HashMap<String, String> = HashMap::new();
+
     // Next up we create a TCP listener which will listen for incoming
     // connections. This TCP listener is bound to the address we determined
     // above and must be associated with an event loop, so we pass in a handle
@@ -124,6 +161,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // to go and start accepting connections.
     let socket = TcpListener::bind(&addr)?;
     println!("Listening on: {}", addr);
+    println!("cache has {} items", cache.len());
 
     // Here we convert the `TcpListener` to a stream of incoming connections
     // with the `incoming` method. We then define how to process each element in
@@ -158,14 +196,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // amount of data that was copied.
 
             let (reader, writer) = socket.split();
-            //let amt = io::copy(reader, writer);
-            let amt = cache_session(reader, writer);
+            let sender = cache_sender.clone();
+            let amt = cache_session(reader, writer, sender);
 
             // After our copy operation is complete we just print out some helpful
             // information.
             let msg = amt.then(move |result| {
                 match result {
-                    Ok((amt, _, _)) => println!("wrote {} bytes", amt),
+                    Ok((amt, _, _)) => println!("wrote {} messages", amt),
                     Err(e) => println!("error: {}", e),
                 }
 
@@ -185,6 +223,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // which will allow all of our clients to be processed concurrently.
             tokio::spawn(msg)
         });
+
+    // loop to handle writes to the cache
+    cache_receiver.for_each(|client_write_message| {
+        let (client, (k, v)) = client_write_message;
+        cache.insert(k, v);
+        client.send(format!("saved '{}' as '{}'", k, v));
+    });
 
     // And finally now that we've define what our server is, we run it!
     //
