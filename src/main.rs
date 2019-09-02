@@ -1,242 +1,156 @@
-//! A "hello world" echo server with Tokio
+//! A chat server that broadcasts a message to all connections.
 //!
-//! This server will create a TCP listener, accept connections in a loop, and
-//! write back everything that's read off of each TCP connection.
+//! This is a line-based server which accepts connections, reads lines from
+//! those connections, and broadcasts the lines to all other connected clients.
 //!
-//! Because the Tokio runtime uses a thread pool, each TCP connection is
-//! processed concurrently with all other TCP connections across multiple
-//! threads.
+//! This example is similar to chat.rs, but uses combinators and a much more
+//! functional style.
 //!
-//! To see this server in action, you can run this in one terminal:
+//! You can test this out by running:
 //!
-//!     cargo run --example echo
+//!     cargo run --example chat
 //!
-//! and in another terminal you can run:
+//! And then in another window run:
 //!
 //!     cargo run --example connect 127.0.0.1:8080
 //!
-//! Each line you type in to the `connect` terminal should be echo'd back to
-//! you! If you open up multiple terminals running the `connect` example you
-//! should be able to see them all make progress simultaneously.
+//! You can run the second command in multiple windows and then chat between the
+//! two, seeing the messages from the other client as they're received. For all
+//! connected clients they'll all join the same room and see everyone else's
+//! messages.
 
 #![deny(warnings)]
 
-extern crate tokio;
-
 extern crate futures;
+extern crate tokio;
 
 use tokio::io;
 use tokio::net::TcpListener;
 use tokio::prelude::*;
 
-use std::env;
-use std::net::SocketAddr;
-
-use futures::sync::{mpsc, oneshot};
 use std::collections::HashMap;
-
-// just like in erlang, you a message has a return address
-type CacheWriteMessage = (oneshot::Sender<String>, (String, String));
-
-pub struct CacheSession<R, W> {
-    reader: Option<R>,
-    read_done: bool,
-    writer: Option<W>,
-    msg_in_flight: Option<String>,
-    amt: u64,
-    cache_sender: mpsc::Sender<CacheWriteMessage>,
-}
-
-pub fn cache_session<R, W>(
-    reader: R,
-    writer: W,
-    cache_sender: mpsc::Sender<CacheWriteMessage>,
-) -> CacheSession<tokio::io::Lines<std::io::BufReader<R>>, W>
-where
-    R: AsyncRead,
-    W: AsyncWrite,
-{
-    let buf_stream = std::io::BufReader::new(reader);
-    let reader = tokio::io::lines(buf_stream);
-    CacheSession {
-        reader: Some(reader),
-        read_done: false,
-        writer: Some(writer),
-        msg_in_flight: None,
-        amt: 0,
-        cache_sender: cache_sender,
-    }
-}
-
-impl<R, W> Future for CacheSession<tokio::io::Lines<std::io::BufReader<R>>, W>
-where
-    R: AsyncRead,
-    W: AsyncWrite,
-{
-    type Item = (u64, tokio::io::Lines<std::io::BufReader<R>>, W);
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<(u64, tokio::io::Lines<std::io::BufReader<R>>, W), io::Error> {
-        loop {
-            // if we do not have a line we are working on, get one
-            if let None = self.msg_in_flight {
-                let reader = self.reader.as_mut().unwrap();
-                let n: Option<String> = futures::try_ready!(reader.poll());
-                self.msg_in_flight = match n {
-                    Some(line) => {
-                        println!("got line {}", line);
-                        self.amt += 1;
-                        Some(line)
-                    }
-                    None => {
-                        self.read_done = true;
-                        None
-                    }
-                };
-            }
-
-            // if we got a line from a past run, or earlier in this loop, process it
-            if let Some(line) = &self.msg_in_flight {
-                println!("sending echo back");
-                let (tx, rx) = oneshot::channel();
-                // somehow i want to send the <k, v> to the cache through cache sender,
-                // and then when it works, send a message back to the client that it worked or that
-                // it didn't work
-                //
-                // I think I need to send it a oneshot rx so that the cache has a way to send the
-                // response back to this client task, but I am having a lot of trouble getting the
-                // compiler to let me do this.  I don't know how to combine this chain-reaction of
-                // inter-related features correctly.
-
-                // old code with compiler error:
-                self.cache_sender
-                    .send((tx, ("kgoat".to_string(), "vgoat".to_string())))
-                    .map_err(|_| ())
-                    .and_then(|cache_sender_handler| {
-                        rx.and_then(|cache_response| {
-                            let msg_to_client = format!("+{}\n", cache_response);
-                            let writer = self.writer.as_mut().unwrap();
-                            writer.write_all(msg_to_client.as_bytes())
-                        })
-                        .map_err(|_| ())
-                        .and_then(|_| println!("i dont know what this means anymore"))
-                    });
-
-                // that i am tracking msg_in_flight out of band with the progress of futures
-                // is probably telling me that i am not doing something right here.  shouldn't this
-                // just be a future?
-                self.msg_in_flight = None;
-            }
-
-            // If we've written al the data and we've seen EOF, flush out the
-            // data and finish the transfer.
-            // done with the entire transfer.
-            if self.read_done {
-                println!("client is closed! waiting on flushing data");
-                futures::try_ready!(self.writer.as_mut().unwrap().poll_flush());
-                // i don't know what these do
-                let reader = self.reader.take().unwrap();
-                let writer = self.writer.take().unwrap();
-                return Ok((self.amt, reader, writer).into());
-            }
-        }
-    }
-}
+use std::env;
+use std::io::BufReader;
+use std::iter;
+use std::sync::{Arc, Mutex};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Allow passing an address to listen on as the first argument of this
-    // program, but otherwise we'll just set up our TCP listener on
-    // 127.0.0.1:8080 for connections.
+    // Create the TCP listener we'll accept connections on.
     let addr = env::args().nth(1).unwrap_or("127.0.0.1:8080".to_string());
-    let addr = addr.parse::<SocketAddr>()?;
+    let addr = addr.parse()?;
 
-    // make a channel so sessions can send messages to the cache
-    let (cache_sender, cache_receiver) = mpsc::channel(1_024);
-    let cache: HashMap<String, String> = HashMap::new();
-
-    // Next up we create a TCP listener which will listen for incoming
-    // connections. This TCP listener is bound to the address we determined
-    // above and must be associated with an event loop, so we pass in a handle
-    // to our event loop. After the socket's created we inform that we're ready
-    // to go and start accepting connections.
     let socket = TcpListener::bind(&addr)?;
     println!("Listening on: {}", addr);
-    println!("cache has {} items", cache.len());
 
-    // Here we convert the `TcpListener` to a stream of incoming connections
-    // with the `incoming` method. We then define how to process each element in
-    // the stream with the `for_each` method.
-    //
-    // This combinator, defined on the `Stream` trait, will allow us to define a
-    // computation to happen for all items on the stream (in this case TCP
-    // connections made to the server).  The return value of the `for_each`
-    // method is itself a future representing processing the entire stream of
-    // connections, and ends up being our server.
-    let done = socket
+    // This is running on the Tokio runtime, so it will be multi-threaded. The
+    // `Arc<Mutex<...>>` allows state to be shared across the threads.
+    let connections = Arc::new(Mutex::new(HashMap::new()));
+    let kv_store = Arc::new(Mutex::new(HashMap::new()));
+
+    // The server task asynchronously iterates over and processes each incoming
+    // connection.
+    let srv = socket
         .incoming()
-        .map_err(|e| println!("failed to accept socket; error = {:?}", e))
-        .for_each(move |socket| {
-            // Once we're inside this closure this represents an accepted client
-            // from our server. The `socket` is the client connection (similar to
-            // how the standard library operates).
-            //
-            // We just want to copy all data read from the socket back onto the
-            // socket itself (e.g. "echo"). We can use the standard `io::copy`
-            // combinator in the `tokio-core` crate to do precisely this!
-            //
-            // The `copy` function takes two arguments, where to read from and where
-            // to write to. We only have one argument, though, with `socket`.
-            // Luckily there's a method, `Io::split`, which will split an Read/Write
-            // stream into its two halves. This operation allows us to work with
-            // each stream independently, such as pass them as two arguments to the
-            // `copy` function.
-            //
-            // The `copy` function then returns a future, and this future will be
-            // resolved when the copying operation is complete, resolving to the
-            // amount of data that was copied.
+        .map_err(|e| {
+            println!("failed to accept socket; error = {:?}", e);
+            e
+        })
+        .for_each(move |stream| {
+            // The client's socket address
+            let addr = stream.peer_addr()?;
 
-            let (reader, writer) = socket.split();
-            let sender = cache_sender.clone();
-            let amt = cache_session(reader, writer, sender);
+            println!("New Connection: {}", addr);
 
-            // After our copy operation is complete we just print out some helpful
-            // information.
-            let msg = amt.then(move |result| {
-                match result {
-                    Ok((amt, _, _)) => println!("wrote {} messages", amt),
-                    Err(e) => println!("error: {}", e),
-                }
+            // Split the TcpStream into two separate handles. One handle for reading
+            // and one handle for writing. This lets us use separate tasks for
+            // reading and writing.
+            let (reader, writer) = stream.split();
 
-                Ok(())
+            // Create a channel for our stream, which other sockets will use to
+            // send us messages. Then register our address with the stream to send
+            // data to us.
+            let (tx, rx) = futures::sync::mpsc::unbounded();
+            connections.lock().unwrap().insert(addr, tx);
+
+            // Define here what we do for the actual I/O. That is, read a bunch of
+            // lines from the socket and dispatch them while we also write any lines
+            // from other sockets.
+            let connections_inner = connections.clone();
+            let kv_store_inner = kv_store.clone();
+            let reader = BufReader::new(reader);
+
+            // Model the read portion of this socket by mapping an infinite
+            // iterator to each line off the socket. This "loop" is then
+            // terminated with an error once we hit EOF on the socket.
+            let iter = stream::iter_ok::<_, io::Error>(iter::repeat(()));
+
+            let socket_reader = iter.fold(reader, move |reader, _| {
+                // Read a line off the socket, failing if we're at EOF
+                let line = io::read_until(reader, b'\n', Vec::new());
+                let line = line.and_then(|(reader, vec)| {
+                    if vec.len() == 0 {
+                        Err(io::Error::new(io::ErrorKind::BrokenPipe, "broken pipe"))
+                    } else {
+                        Ok((reader, vec))
+                    }
+                });
+
+                // Convert the bytes we read into a string, and then send that
+                // string to all other connected clients.
+                let line = line.map(|(reader, vec)| (reader, String::from_utf8(vec)));
+
+                // Move the connection state into the closure below.
+                let connections = connections_inner.clone();
+                let kv_store_handle = kv_store_inner.clone();
+
+                line.map(move |(reader, message)| {
+                    println!("{}: {:?}", addr, message);
+                    let mut conns = connections.lock().unwrap();
+
+                    if let Ok(msg) = message {
+                        let mut kv = kv_store_handle.lock().unwrap();
+                        kv.insert(format!("{}", addr), format!("{}", msg));
+
+                        let tx = conns.get_mut(&addr).unwrap();
+                        tx.unbounded_send(format!("+{}", msg)).unwrap();
+                        println!("thing now {:?}", kv);
+                    } else {
+                        let tx = conns.get_mut(&addr).unwrap();
+                        tx.unbounded_send("You didn't send valid UTF-8.".to_string())
+                            .unwrap();
+                    }
+
+                    reader
+                })
             });
 
-            // And this is where much of the magic of this server happens. We
-            // crucially want all clients to make progress concurrently, rather than
-            // blocking one on completion of another. To achieve this we use the
-            // `tokio::spawn` function to execute the work in the background.
-            //
-            // This function will transfer ownership of the future (`msg` in this
-            // case) to the Tokio runtime thread pool that. The thread pool will
-            // drive the future to completion.
-            //
-            // Essentially here we're executing a new task to run concurrently,
-            // which will allow all of our clients to be processed concurrently.
-            tokio::spawn(msg)
-        });
+            // Whenever we receive a string on the Receiver, we write it to
+            // `WriteHalf<TcpStream>`.
+            let socket_writer = rx.fold(writer, |writer, msg| {
+                let amt = io::write_all(writer, msg.into_bytes());
+                let amt = amt.map(|(writer, _)| writer);
+                amt.map_err(|_| ())
+            });
 
-    // loop to handle writes to the cache
-    cache_receiver.for_each(|client_write_message| {
-        let (client, (k, v)) = client_write_message;
-        cache.insert(k, v);
-        client.send(format!("saved '{}' as '{}'", k, v));
-    });
+            // Now that we've got futures representing each half of the socket, we
+            // use the `select` combinator to wait for either half to be done to
+            // tear down the other. Then we spawn off the result.
+            let connections = connections.clone();
+            let socket_reader = socket_reader.map_err(|_| ());
+            let connection = socket_reader.map(|_| ()).select(socket_writer.map(|_| ()));
 
-    // And finally now that we've define what our server is, we run it!
-    //
-    // This starts the Tokio runtime, spawns the server task, and blocks the
-    // current thread until all tasks complete execution. Since the `done` task
-    // never completes (it just keeps accepting sockets), `tokio::run` blocks
-    // forever (until ctrl-c is pressed).
-    tokio::run(done);
+            // Spawn a task to process the connection
+            tokio::spawn(connection.then(move |_| {
+                connections.lock().unwrap().remove(&addr);
+                println!("Connection {} closed.", addr);
+                Ok(())
+            }));
+
+            Ok(())
+        })
+        .map_err(|err| println!("error occurred: {:?}", err));
+
+    // execute server
+    tokio::run(srv);
     Ok(())
 }
